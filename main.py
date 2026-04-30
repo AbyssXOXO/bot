@@ -6,6 +6,7 @@ import secrets
 import asyncio
 import contextlib
 import logging
+import json
 import enka
 from aiohttp import web
 from telebot import types
@@ -22,12 +23,18 @@ from enka.errors import (
 )
 from uptime import get_uptime
 
+try:
+    import redis.asyncio as redis
+except ImportError:
+    redis = None
+
 LOGGER = logging.getLogger(__name__)
 
 # 1. Grab environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 PORT = int(os.environ.get('PORT', 5000))
 RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
+REDIS_URL = os.environ.get('REDIS_URL')
 ENKA_USER_AGENT = os.environ.get(
     'ENKA_USER_AGENT',
     'TelegramZZZBot/1.0 (https://render.com)'
@@ -43,15 +50,42 @@ routes = web.RouteTableDef()
 
 UID_PATTERN = re.compile(r'^\d{8,12}$')
 CALLBACK_PREFIX = 'zzz'
+ALLOWED_MESSAGE_COMMANDS = {'/uptime', '/uid'}
 SHOWCASE_SESSION_SECONDS = 15 * 60
 MAX_SHOWCASE_SESSIONS = 100
 SHOWCASE_SESSIONS = {}
 UPDATE_TASKS = set()
+SHOWCASE_CACHE_PREFIX = 'zzz_showcase:'
+redis_client = None
 
 
 def escape(value):
     """Escape text for Telegram's HTML parse mode."""
     return html.escape(str(value), quote=False)
+
+
+def command_name(text):
+    text = (text or '').strip()
+    if not text:
+        return None
+
+    first_token = text.split(maxsplit=1)[0]
+    if not first_token.startswith('/'):
+        return None
+    return first_token.split('@', 1)[0].lower()
+
+
+def is_allowed_message(message):
+    return command_name(getattr(message, 'text', None)) in ALLOWED_MESSAGE_COMMANDS
+
+
+def should_process_update(update):
+    callback_query = getattr(update, 'callback_query', None)
+    callback_data = getattr(callback_query, 'data', None)
+    if callback_data and callback_data.startswith(f'{CALLBACK_PREFIX}:'):
+        return True
+
+    return is_allowed_message(getattr(update, 'message', None))
 
 
 def cleanup_showcase_sessions():
@@ -71,16 +105,47 @@ def cleanup_showcase_sessions():
         SHOWCASE_SESSIONS.pop(oldest_token, None)
 
 
-def cache_showcase(response):
-    cleanup_showcase_sessions()
-    token = secrets.token_urlsafe(6)
+def cache_showcase_in_memory(token, payload):
     now = time.time()
     SHOWCASE_SESSIONS[token] = {
         'created_at': now,
         'expires_at': now + SHOWCASE_SESSION_SECONDS,
-        'response': response,
+        'payload': payload,
     }
+
+
+async def cache_showcase(payload):
+    cleanup_showcase_sessions()
+    token = secrets.token_urlsafe(6)
+    cache_showcase_in_memory(token, payload)
+
+    if redis_client is not None:
+        try:
+            await redis_client.setex(
+                f'{SHOWCASE_CACHE_PREFIX}{token}',
+                SHOWCASE_SESSION_SECONDS,
+                json.dumps(payload),
+            )
+        except Exception:
+            LOGGER.exception("Failed to cache showcase in Redis")
+
     return token
+
+
+async def get_cached_showcase(token):
+    if redis_client is not None:
+        try:
+            cached = await redis_client.get(f'{SHOWCASE_CACHE_PREFIX}{token}')
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            LOGGER.exception("Failed to read showcase from Redis")
+
+    cleanup_showcase_sessions()
+    session = SHOWCASE_SESSIONS.get(token)
+    if not session:
+        return None
+    return session['payload']
 
 
 async def fetch_zzz_showcase(uid):
@@ -215,20 +280,34 @@ def player_summary(response):
     return '\n'.join(lines)
 
 
-def build_agent_keyboard(response, token):
+def build_agent_keyboard(agents, token):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
 
-    for index, agent in enumerate(response.agents):
+    for index, agent in enumerate(agents):
         buttons.append(
             types.InlineKeyboardButton(
-                text=character_button_label(agent),
+                text=agent['label'],
                 callback_data=f'{CALLBACK_PREFIX}:{token}:{index}',
             )
         )
 
     markup.add(*buttons)
     return markup
+
+
+def build_showcase_payload(response):
+    return {
+        'summary': player_summary(response),
+        'agents': [
+            {
+                'label': character_button_label(agent),
+                'name': getattr(agent, 'name', 'agent') or 'agent',
+                'text': format_agent_stats(response, agent),
+            }
+            for agent in response.agents
+        ],
+    }
 
 
 def format_w_engine(engine):
@@ -350,19 +429,6 @@ def enka_error_message(error):
 
 
 # 3. Telegram Command Handlers
-@bot.message_handler(commands=['start', 'help'])
-async def help_command(message):
-    await bot.reply_to(
-        message,
-        (
-            '<b>Commands</b>\n'
-            '/uptime - show how long the bot has been running\n'
-            '/uid &lt;zzz uid&gt; - fetch a ZZZ showcase and choose an agent'
-        ),
-        disable_web_page_preview=True,
-    )
-
-
 @bot.message_handler(commands=['uptime'])
 async def uptime_command(message):
     """Shows how long the bot has been running in Telegram."""
@@ -404,12 +470,13 @@ async def uid_command(message):
         )
         return
 
-    token = cache_showcase(response)
+    showcase = build_showcase_payload(response)
+    token = await cache_showcase(showcase)
     await update_message(
         status_message.chat.id,
         status_message.message_id,
-        player_summary(response),
-        reply_markup=build_agent_keyboard(response, token),
+        showcase['summary'],
+        reply_markup=build_agent_keyboard(showcase['agents'], token),
     )
 
 
@@ -424,8 +491,8 @@ async def zzz_agent_callback(call):
         await bot.answer_callback_query(call.id, 'This selection is invalid.', show_alert=True)
         return
 
-    session = SHOWCASE_SESSIONS.get(token)
-    if not session:
+    showcase = await get_cached_showcase(token)
+    if not showcase:
         await bot.answer_callback_query(
             call.id,
             'This selection expired. Run /uid again.',
@@ -433,26 +500,20 @@ async def zzz_agent_callback(call):
         )
         return
 
-    response = session['response']
-    agents = getattr(response, 'agents', []) or []
+    agents = showcase.get('agents', [])
     if index < 0 or index >= len(agents):
         await bot.answer_callback_query(call.id, 'That agent is no longer available.', show_alert=True)
         return
 
     agent = agents[index]
-    await bot.answer_callback_query(call.id, f"Showing {getattr(agent, 'name', 'agent')} stats")
+    await bot.answer_callback_query(call.id, f"Showing {agent.get('name', 'agent')} stats")
     await bot.send_message(
         call.message.chat.id,
-        format_agent_stats(response, agent),
+        agent['text'],
         parse_mode='HTML',
         disable_web_page_preview=True,
     )
 
-
-@bot.message_handler(func=lambda message: True)
-async def fallback(message):
-    """Small help fallback for unknown messages."""
-    await bot.reply_to(message, 'Use /uid &lt;zzz uid&gt; or /uptime.')
 
 # 4. Webhook Route for Telegram Updates
 async def process_update(update):
@@ -480,6 +541,9 @@ async def webhook(request):
     if update is None:
         raise web.HTTPBadRequest(text='Invalid Telegram update')
 
+    if not should_process_update(update):
+        return web.Response(status=200)
+
     schedule_update(update)
     return web.Response(status=200)
 
@@ -498,11 +562,41 @@ async def show_uptime(request):
     return web.Response(text=f"Telegram Bot Uptime: {get_uptime()}")
 
 
+async def setup_redis():
+    global redis_client
+
+    if not REDIS_URL:
+        return
+
+    if redis is None:
+        LOGGER.warning("REDIS_URL is set, but the redis package is not installed.")
+        return
+
+    redis_client = redis.from_url(
+        REDIS_URL,
+        encoding='utf-8',
+        decode_responses=True,
+    )
+
+    try:
+        await redis_client.ping()
+        LOGGER.info("Connected to Redis cache.")
+    except Exception:
+        LOGGER.exception("Could not connect to Redis. Falling back to in-memory cache.")
+        with contextlib.suppress(Exception):
+            await redis_client.aclose()
+        redis_client = None
+
+
 async def setup_webhook(app):
+    await setup_redis()
     await bot.remove_webhook()
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{BOT_TOKEN}"
-        await bot.set_webhook(url=webhook_url)
+        await bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=['message', 'callback_query'],
+        )
         LOGGER.info("Webhook set to: %s", webhook_url)
     else:
         LOGGER.warning("RENDER_EXTERNAL_URL not found. Webhook not set.")
@@ -517,6 +611,10 @@ async def cleanup(app):
 
     with contextlib.suppress(Exception):
         await bot.close_session()
+
+    if redis_client is not None:
+        with contextlib.suppress(Exception):
+            await redis_client.aclose()
 
 
 app.router.add_routes(routes)
