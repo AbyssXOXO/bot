@@ -4,9 +4,7 @@ from flask import Flask, request, abort
 
 # 1. Grab environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-# Render assigns a PORT dynamically to web services
 PORT = int(os.environ.get('PORT', 5000))
-# Render automatically provides this variable with your app's live URL
 RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL') 
 
 if not BOT_TOKEN:
@@ -40,17 +38,16 @@ def index():
     """Render pings this route to ensure the app is live."""
     return "Telegram Echo Bot is running!", 200
 
-if __name__ == '__main__':
-    # 6. Configure the Webhook
-    bot.remove_webhook()
-    
-    if RENDER_EXTERNAL_URL:
-        # Set the webhook to point to your Render app + the bot token route for security
-        webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
-        bot.set_webhook(url=webhook_url)
-        print(f"Webhook set to: {webhook_url}")
-    else:
-        print("Warning: RENDER_EXTERNAL_URL not found. Running locally? Webhook not set.")
+# 6. Configure the Webhook (MOVED OUTSIDE OF __main__)
+bot.remove_webhook()
+if RENDER_EXTERNAL_URL:
+    # Set the webhook to point to your Render app + the bot token route
+    webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
+    bot.set_webhook(url=webhook_url)
+    print(f"Webhook set to: {webhook_url}")
+else:
+    print("Warning: RENDER_EXTERNAL_URL not found. Webhook not set.")
 
-    # 7. Start the Flask server
+# 7. Start the Flask server (Only for local testing now, Gunicorn ignores this)
+if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT)
