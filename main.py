@@ -1,6 +1,7 @@
 import os
 import telebot
 from flask import Flask, request, abort
+from uptime import get_uptime
 
 # 1. Grab environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -37,6 +38,12 @@ def webhook():
 def index():
     """Render pings this route to ensure the app is live."""
     return "Telegram Echo Bot is running!", 200
+
+# 5.5 Uptime Route
+@app.route('/uptime', methods=['GET'])
+def show_uptime():
+    """Shows how long the bot has been running."""
+    return f"Telegram Bot Uptime: {get_uptime()}", 200
 
 # 6. Configure the Webhook (MOVED OUTSIDE OF __main__)
 bot.remove_webhook()
