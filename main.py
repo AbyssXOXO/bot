@@ -4,10 +4,13 @@ import time
 import html
 import secrets
 import asyncio
-import telebot
+import contextlib
+import logging
 import enka
-from flask import Flask, request, abort
+from aiohttp import web
 from telebot import types
+from telebot.async_telebot import AsyncTeleBot
+from telebot.asyncio_helper import ApiTelegramException
 from enka.errors import (
     APIRequestTimeoutError,
     EnkaAPIError,
@@ -19,10 +22,12 @@ from enka.errors import (
 )
 from uptime import get_uptime
 
+LOGGER = logging.getLogger(__name__)
+
 # 1. Grab environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 PORT = int(os.environ.get('PORT', 5000))
-RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL') 
+RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
 ENKA_USER_AGENT = os.environ.get(
     'ENKA_USER_AGENT',
     'TelegramZZZBot/1.0 (https://render.com)'
@@ -31,25 +36,22 @@ ENKA_USER_AGENT = os.environ.get(
 if not BOT_TOKEN:
     raise ValueError("No BOT_TOKEN found. Please set it in Render's environment variables.")
 
-# 2. Initialize Bot and Flask App
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode='HTML')
-app = Flask(__name__)
+# 2. Initialize async Bot and aiohttp App
+bot = AsyncTeleBot(BOT_TOKEN, parse_mode='HTML', disable_web_page_preview=True)
+app = web.Application()
+routes = web.RouteTableDef()
 
 UID_PATTERN = re.compile(r'^\d{8,12}$')
 CALLBACK_PREFIX = 'zzz'
 SHOWCASE_SESSION_SECONDS = 15 * 60
 MAX_SHOWCASE_SESSIONS = 100
 SHOWCASE_SESSIONS = {}
+UPDATE_TASKS = set()
 
 
 def escape(value):
     """Escape text for Telegram's HTML parse mode."""
     return html.escape(str(value), quote=False)
-
-
-def run_async(coro):
-    """Run the async Enka wrapper from pyTelegramBotAPI's sync handlers."""
-    return asyncio.run(coro)
 
 
 def cleanup_showcase_sessions():
@@ -90,9 +92,9 @@ async def fetch_zzz_showcase(uid):
         return await client.fetch_showcase(uid)
 
 
-def update_message(chat_id, message_id, text, reply_markup=None):
+async def update_message(chat_id, message_id, text, reply_markup=None):
     try:
-        bot.edit_message_text(
+        await bot.edit_message_text(
             text,
             chat_id=chat_id,
             message_id=message_id,
@@ -100,8 +102,8 @@ def update_message(chat_id, message_id, text, reply_markup=None):
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
-    except telebot.apihelper.ApiTelegramException:
-        bot.send_message(
+    except ApiTelegramException:
+        await bot.send_message(
             chat_id,
             text,
             parse_mode='HTML',
@@ -349,8 +351,8 @@ def enka_error_message(error):
 
 # 3. Telegram Command Handlers
 @bot.message_handler(commands=['start', 'help'])
-def help_command(message):
-    bot.reply_to(
+async def help_command(message):
+    await bot.reply_to(
         message,
         (
             '<b>Commands</b>\n'
@@ -362,26 +364,29 @@ def help_command(message):
 
 
 @bot.message_handler(commands=['uptime'])
-def uptime_command(message):
+async def uptime_command(message):
     """Shows how long the bot has been running in Telegram."""
-    bot.reply_to(message, f"Uptime: <code>{escape(get_uptime())}</code>")
+    await bot.reply_to(message, f"Uptime: <code>{escape(get_uptime())}</code>")
 
 
 @bot.message_handler(commands=['uid'])
-def uid_command(message):
+async def uid_command(message):
     parts = (message.text or '').split(maxsplit=1)
     if len(parts) != 2 or not UID_PATTERN.match(parts[1].strip()):
-        bot.reply_to(message, 'Usage: <code>/uid 1000000000</code>')
+        await bot.reply_to(message, 'Usage: <code>/uid 1000000000</code>')
         return
 
     uid = parts[1].strip()
-    status_message = bot.reply_to(message, f"Fetching ZZZ showcase for UID <code>{escape(uid)}</code>...")
+    status_message = await bot.reply_to(
+        message,
+        f"Fetching ZZZ showcase for UID <code>{escape(uid)}</code>...",
+    )
 
     try:
-        response = run_async(fetch_zzz_showcase(uid))
+        response = await fetch_zzz_showcase(uid)
     except Exception as error:
-        print(f"Failed to fetch ZZZ showcase for UID {uid}: {error!r}")
-        update_message(
+        LOGGER.exception("Failed to fetch ZZZ showcase for UID %s", uid)
+        await update_message(
             status_message.chat.id,
             status_message.message_id,
             enka_error_message(error),
@@ -389,7 +394,7 @@ def uid_command(message):
         return
 
     if not getattr(response, 'agents', None):
-        update_message(
+        await update_message(
             status_message.chat.id,
             status_message.message_id,
             (
@@ -400,7 +405,7 @@ def uid_command(message):
         return
 
     token = cache_showcase(response)
-    update_message(
+    await update_message(
         status_message.chat.id,
         status_message.message_id,
         player_summary(response),
@@ -409,19 +414,19 @@ def uid_command(message):
 
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith(f'{CALLBACK_PREFIX}:')))
-def zzz_agent_callback(call):
+async def zzz_agent_callback(call):
     cleanup_showcase_sessions()
 
     try:
         _, token, index_text = call.data.split(':', 2)
         index = int(index_text)
     except (TypeError, ValueError):
-        bot.answer_callback_query(call.id, 'This selection is invalid.', show_alert=True)
+        await bot.answer_callback_query(call.id, 'This selection is invalid.', show_alert=True)
         return
 
     session = SHOWCASE_SESSIONS.get(token)
     if not session:
-        bot.answer_callback_query(
+        await bot.answer_callback_query(
             call.id,
             'This selection expired. Run /uid again.',
             show_alert=True,
@@ -431,12 +436,12 @@ def zzz_agent_callback(call):
     response = session['response']
     agents = getattr(response, 'agents', []) or []
     if index < 0 or index >= len(agents):
-        bot.answer_callback_query(call.id, 'That agent is no longer available.', show_alert=True)
+        await bot.answer_callback_query(call.id, 'That agent is no longer available.', show_alert=True)
         return
 
     agent = agents[index]
-    bot.answer_callback_query(call.id, f"Showing {getattr(agent, 'name', 'agent')} stats")
-    bot.send_message(
+    await bot.answer_callback_query(call.id, f"Showing {getattr(agent, 'name', 'agent')} stats")
+    await bot.send_message(
         call.message.chat.id,
         format_agent_stats(response, agent),
         parse_mode='HTML',
@@ -445,44 +450,81 @@ def zzz_agent_callback(call):
 
 
 @bot.message_handler(func=lambda message: True)
-def fallback(message):
+async def fallback(message):
     """Small help fallback for unknown messages."""
-    bot.reply_to(message, 'Use /uid &lt;zzz uid&gt; or /uptime.')
+    await bot.reply_to(message, 'Use /uid &lt;zzz uid&gt; or /uptime.')
 
 # 4. Webhook Route for Telegram Updates
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
-    """Receives JSON updates from Telegram and passes them to the bot."""
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    else:
-        abort(403)
+async def process_update(update):
+    """Process a Telegram update outside the webhook response path."""
+    try:
+        await bot.process_new_updates([update])
+    except Exception:
+        LOGGER.exception("Failed to process Telegram update")
+
+
+def schedule_update(update):
+    task = asyncio.create_task(process_update(update))
+    UPDATE_TASKS.add(task)
+    task.add_done_callback(UPDATE_TASKS.discard)
+
+
+@routes.post(f'/{BOT_TOKEN}')
+async def webhook(request):
+    """Receives JSON updates from Telegram and schedules async handling."""
+    if request.content_type != 'application/json':
+        raise web.HTTPForbidden()
+
+    json_string = await request.text()
+    update = types.Update.de_json(json_string)
+    if update is None:
+        raise web.HTTPBadRequest(text='Invalid Telegram update')
+
+    schedule_update(update)
+    return web.Response(status=200)
+
 
 # 5. Health Check Route for Render
-@app.route('/', methods=['GET'])
-def index():
+@routes.get('/')
+async def index(request):
     """Render pings this route to ensure the app is live."""
-    return "Telegram Echo Bot is running!", 200
+    return web.Response(text="Telegram ZZZ Bot is running!")
+
 
 # 5.5 Uptime Route
-@app.route('/uptime', methods=['GET'])
-def show_uptime():
+@routes.get('/uptime')
+async def show_uptime(request):
     """Shows how long the bot has been running."""
-    return f"Telegram Bot Uptime: {get_uptime()}", 200
+    return web.Response(text=f"Telegram Bot Uptime: {get_uptime()}")
 
-# 6. Configure the Webhook (MOVED OUTSIDE OF __main__)
-bot.remove_webhook()
-if RENDER_EXTERNAL_URL:
-    # Set the webhook to point to your Render app + the bot token route
-    webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
-    bot.set_webhook(url=webhook_url)
-    print(f"Webhook set to: {webhook_url}")
-else:
-    print("Warning: RENDER_EXTERNAL_URL not found. Webhook not set.")
 
-# 7. Start the Flask server (Only for local testing now, Gunicorn ignores this)
+async def setup_webhook(app):
+    await bot.remove_webhook()
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{BOT_TOKEN}"
+        await bot.set_webhook(url=webhook_url)
+        LOGGER.info("Webhook set to: %s", webhook_url)
+    else:
+        LOGGER.warning("RENDER_EXTERNAL_URL not found. Webhook not set.")
+
+
+async def cleanup(app):
+    for task in list(UPDATE_TASKS):
+        task.cancel()
+
+    if UPDATE_TASKS:
+        await asyncio.gather(*UPDATE_TASKS, return_exceptions=True)
+
+    with contextlib.suppress(Exception):
+        await bot.close_session()
+
+
+app.router.add_routes(routes)
+app.on_startup.append(setup_webhook)
+app.on_shutdown.append(cleanup)
+
+
+# 6. Start the aiohttp server for local testing. Gunicorn should use aiohttp's worker on Render.
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=PORT)
+    logging.basicConfig(level=logging.INFO)
+    web.run_app(app, host='0.0.0.0', port=PORT)
