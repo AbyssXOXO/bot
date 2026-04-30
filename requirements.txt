@@ -2,3 +2,4 @@ pyTelegramBotAPI==4.14.1
 aiohttp==3.13.5
 gunicorn==21.2.0
 enka==2.5.19
+redis==5.0.8
