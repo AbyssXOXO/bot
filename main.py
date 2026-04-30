@@ -11,7 +11,7 @@ if not BOT_TOKEN:
     raise ValueError("No BOT_TOKEN found. Please set it in Render's environment variables.")
 
 # 2. Initialize Bot and Flask App
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
 # 3. Define the Echo Handler
